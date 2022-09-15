@@ -1,0 +1,87 @@
+import * from "./grain-test"
+import Hopper from "../hopper"
+import Form from "../hopper-form"
+import Map from "map"
+
+let makeRequest = (contentType, body) => {
+  _message: {
+    _wagiEnv: Map.make(),
+    _params: Map.make(),
+    _query: Map.make()
+  },
+  _headers: Map.fromList([("Content-Type", contentType)]),
+  _body: body,
+  _variables: Map.make()
+}: Hopper.Request
+
+testMultiple("urlencodedFormBody", [
+  (
+    "multiple=first&single=val&multiple=second",
+    "application/x-www-form-urlencoded; charset=utf-8",
+    Ok(Map.fromList([("single", Hopper.Val("val")), ("multiple", Hopper.Vals(["first", "second"]))]))
+  ),
+  (
+    "multiple=first&single=val&multiple=second",
+    "application/json",
+    Err(Form.ContentTypeNotAllowed)
+  )
+], ((body, contentType, expected)) => {
+  let req = makeRequest(contentType, body)
+  assertThat(Form.urlEncodedFormBody(req), equals(expected))
+})
+
+let body = (
+  "--boundary\r\n" ++
+  "Content-Disposition: form-data; name=\"textVal\"\r\n" ++
+  "\r\n" ++
+  "text1\r\n" ++
+  "--boundary\r\n" ++
+  "Content-Disposition: form-data; name=\"fileVal\"; filename=\"file.txt\"\r\n" ++
+  "Content-Type: text/plain\r\n" ++
+  "\r\n" ++
+  "First line\r\n" ++
+  "Second line\r\n" ++
+  "\r\n" ++
+  "--boundary\r\n" ++
+  "Content-Disposition: form-data; name=\"textVal\"\r\n" ++
+  "\r\n" ++
+  "text2\r\n" ++
+  "--boundary--\r\n"
+)
+
+testMultiple("multipartFormBody", [
+  (
+    body,
+    "multipart/form-data; boundary=boundary",
+    Ok(Map.fromList([
+      ("textVal", Hopper.Vals([Form.TextPart("text1"), Form.TextPart("text2")])),
+      ("fileVal", Hopper.Val(Form.FilePart({
+        filename: "file.txt",
+        contentType: "text/plain",
+        content: "First line\r\nSecond line\r\n"
+      }: Form.FilePartData)))
+    ]))
+  ),
+  (
+    "",
+    "application/json",
+    Err(Form.ContentTypeNotAllowed)
+  ),
+  (
+    "",
+    "multipart/form-data; whoopsnoboundary",
+    Err(Form.InvalidFormData("Form data missing boundary"))
+  ),
+  (
+    (
+      "--boundary\n" ++
+      "Content-Disposition: whoopsno-form-data\n" ++
+      "--boundary--"
+    ),
+    "multipart/form-data; boundary=boundary",
+    Err(Form.InvalidFormData("Part missing Content-Disposition: form-data header"))
+  )
+], ((body, contentType, expected)) => {
+  let req = makeRequest(contentType, body)
+  assertThat(Form.multipartFormBody(req), equals(expected))
+})

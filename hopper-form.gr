@@ -1,0 +1,184 @@
+/**
+ * @module HopperForm: An HTML form body parsing extension for Hopper.
+ * 
+ * Version 0.1.0
+ */
+
+import Hopper from "./hopper"
+import String from "string"
+import List from "list"
+import Array from "array"
+import Result from "result"
+import Regex from "regex"
+import Char from "char"
+import Option from "option"
+
+/**
+ * @section Types: Type declarations included in the hopper-form module
+ */
+
+/**
+ * Represents data for a file for `multipart/form-data` requests.
+ */
+export record FilePartData {
+  filename: String,
+  contentType: String,
+  content: String,
+}
+
+/**
+ * Represents data for `multipart/form-data` requests.
+ */
+export enum Part {
+  FilePart(FilePartData),
+  TextPart(String),
+}
+
+/**
+ * Represents possible errors encountered while parsing form bodies.
+ */
+export enum FormError {
+  ContentTypeNotAllowed,
+  InvalidFormData(String),
+}
+
+/**
+ * @section Values: Functions for parsing HTML form body data.
+ */
+
+/**
+ * Parses an HTTP request body with URL-encoded form data into a `Map` mapping
+ * form item names to their values. The keys/values are expected to be
+ * URL-encoded and the request is expected to have a
+ * `Content-Type: application/x-www-form-urlencoded` header
+ * 
+ * @param req: The incoming `Request`
+ * @returns A `Result` with a `Map` mapping form item names to their values or an error reason
+ */
+export let urlEncodedFormBody = req => {
+  match (Hopper.header("Content-Type", req)) {
+    Some(t) when String.startsWith("application/x-www-form-urlencoded", t) => {
+      let formData = Hopper.urlDecode(Hopper.body(req))
+      Ok(formData)
+    },
+    _ => Err(ContentTypeNotAllowed),
+  }
+}
+
+let toLower = str => {
+  String.implode(
+    Array.map(c => {
+      let code = Char.code(c)
+      if (code >= 65 && code <= 90) Char.fromCode(code + 32) else c
+    }, String.explode(str))
+  )
+}
+
+let partContentDisposition = headers => {
+  let regex = Result.unwrap(Regex.make("^content-disposition:\\s*form-data;"))
+  let contentDispositionLine = List.find(line =>
+    Regex.isMatch(regex, toLower(line)), headers)
+  match (contentDispositionLine) {
+    None =>
+      Err(
+        InvalidFormData("Part missing Content-Disposition: form-data header")
+      ),
+    Some(contentDispositionLine) => {
+      // TODO can make more robust
+      let nameRegex = Result.unwrap(Regex.make("name=\"([^\"]+)\""))
+      let filenameRegex = Result.unwrap(Regex.make("filename=\"([^\"]+)\""))
+      match (Regex.find(nameRegex, contentDispositionLine)) {
+        None =>
+          Err(
+            InvalidFormData("Part missing name in Content-Disposition header")
+          ),
+        Some(reMatch) => {
+          let name = Option.unwrap(reMatch.group(1))
+          let filenameMatch = Regex.find(filenameRegex, contentDispositionLine)
+          let filename = Option.map((m: Regex.MatchResult) => Option.unwrap(m.group(1)), filenameMatch)
+          Ok((name, filename))
+        },
+      }
+    },
+  }
+}
+
+let partContentType = (headers, filename) => {
+  let contentTypeLine = List.find(line =>
+    String.startsWith("content-type:", toLower(line)), headers)
+  match (contentTypeLine) {
+    Some(line) => {
+      let (bi, ei) = (String.length("content-type:"), String.length(line))
+      String.trim(String.slice(bi, ei, line))
+    },
+    None => Hopper.guessMimeType(filename),
+  }
+}
+
+let readMultipart = (body, boundary) => {
+  let lines = Array.toList(String.split("\r\n", body))
+  // first line will be boundary
+  let [_, ...lines] = lines
+  let lines = List.takeWhile(line => line != "--" ++ boundary ++ "--", lines)
+  let parts = List.reduceRight((line, parts) => {
+    if (line == "--" ++ boundary) {
+      [[], ...parts]
+    } else {
+      let [partLines, ...rest] = parts
+      [[line, ...partLines], ...rest]
+    }
+  }, [[]], lines)
+  let multipartNameVals = List.reduceRight((partLines, multipartNameVals) => {
+    match (multipartNameVals) {
+      Err(err) => Err(err),
+      Ok(multipartNameVals) => {
+        let lineEmpty = line => String.trim(line) == ""
+        let headers = List.takeWhile(line => !lineEmpty(line), partLines)
+
+        match (partContentDisposition(headers)) {
+          Err(err) => Err(err),
+          Ok((name, filename)) => {
+            let afterHeaders = List.dropWhile(line =>
+              !lineEmpty(line), partLines)
+            let body = List.dropWhile(lineEmpty, afterHeaders)
+            let bodyStr = List.join("\r\n", body)
+            let val = match (filename) {
+              Some(filename) => {
+                let contentType = partContentType(headers, filename)
+                FilePart({ filename, contentType, content: bodyStr })
+              },
+              None => TextPart(bodyStr),
+            }
+            Ok([(name, val), ...multipartNameVals])
+          },
+        }
+      },
+    }
+  }, Ok([]), parts)
+  Result.map(Hopper.joinOneOrManyMap, multipartNameVals)
+}
+
+/**
+ * Parses an HTTP request body with multipart form data into a `Map` mapping
+ * form item names to their values. The request should have
+ * a `Content-Type: multipart/form-data` header
+ * 
+ * @param req: The incoming `Request`
+ * @returns A `Result` with a `Map` mapping form item names to their values or an error reason
+ */
+export let multipartFormBody = req => {
+  match (Hopper.header("Content-Type", req)) {
+    Some(val) when String.startsWith("multipart/form-data;", val) => {
+      let (bi, ei) = (String.length("multipart/form-data;"), String.length(val))
+      let boundary = String.trim(String.slice(bi, ei, val))
+      if (String.startsWith("boundary=", boundary)) {
+        let (bi, ei) = (String.length("boundary="), String.length(boundary))
+        let boundaryVal = String.slice(bi, ei, boundary)
+        readMultipart(Hopper.body(req), boundaryVal)
+      } else {
+        Err(InvalidFormData("Form data missing boundary"))
+      }
+    },
+    _ => Err(ContentTypeNotAllowed),
+  }
+}
